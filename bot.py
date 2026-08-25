@@ -9,18 +9,38 @@ OPTIMIZATIONS:
 - MARGIN SUPPORT: Up to 10x leverage
 - BETTER PROFIT: Improved entry/exit strategy with trailing stops
 - AGGRESSIVE RISK MANAGEMENT: 0.5-2% risk per trade (configurable)
+- RAILWAY READY: Proper asyncio event loop, signal handling, graceful shutdown
 """
 
 import os
 import sys
 import asyncio
 import logging
+import signal
 from datetime import datetime
 from typing import Optional, Dict, List
 from dataclasses import dataclass
 from enum import Enum
 
 import aiohttp
+from dotenv import load_dotenv
+
+# Load environment variables from .env file (for local development)
+load_dotenv()
+
+# ============================================================================
+# ASYNCIO EVENT LOOP SETUP (Railway/Production Safe)
+# ============================================================================
+
+# Set proper event loop policy for different platforms
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+else:
+    # Linux/Railway: Use default policy
+    try:
+        asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+    except Exception as e:
+        print(f"Note: Could not set event loop policy: {e}")
 
 # ============================================================================
 # CONFIGURATION & SAFETY LOCK
@@ -32,6 +52,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Global shutdown flag
+SHUTDOWN_EVENT = asyncio.Event() if asyncio._get_running_loop() is None else None
+
+def signal_handler(signum, frame):
+    """Handle graceful shutdown on SIGTERM/SIGINT."""
+    logger.info("🛑 Received shutdown signal (SIGTERM/SIGINT), shutting down gracefully...")
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
 # *** SAFETY LOCK: PAPER_MODE cannot be disabled ***
 PAPER_MODE = os.getenv('PAPER_MODE', 'true').lower() == 'true'
 if not PAPER_MODE:
@@ -41,19 +73,19 @@ logger.info("✓ PAPER_MODE=true (safety lock active)")
 
 # Configuration from environment variables
 STARTING_BALANCE = float(os.getenv('STARTING_BALANCE', '50'))
-RISK_PER_TRADE = float(os.getenv('RISK_PER_TRADE', '0.01'))  # 1% per trade (HIGHER for more profit)
-MAX_LEVERAGE = float(os.getenv('MAX_LEVERAGE', '10'))  # 10x margin
-TARGET_RETURN = float(os.getenv('TARGET_RETURN', '0.05'))  # 5% per winning trade
-SCAN_INTERVAL = int(os.getenv('SCAN_INTERVAL_SECONDS', '120'))  # 2 minutes (faster scanning)
-CONFIDENCE_THRESHOLD = float(os.getenv('CONFIDENCE_THRESHOLD', '0.80'))  # 80% confidence
-SLIPPAGE = float(os.getenv('SLIPPAGE', '0.001'))  # 0.1%
+RISK_PER_TRADE = float(os.getenv('RISK_PER_TRADE', '0.01'))
+MAX_LEVERAGE = float(os.getenv('MAX_LEVERAGE', '10'))
+TARGET_RETURN = float(os.getenv('TARGET_RETURN', '0.05'))
+SCAN_INTERVAL = int(os.getenv('SCAN_INTERVAL_SECONDS', '120'))
+CONFIDENCE_THRESHOLD = float(os.getenv('CONFIDENCE_THRESHOLD', '0.80'))
+SLIPPAGE = float(os.getenv('SLIPPAGE', '0.001'))
 
-# Symbols to trade (focus on high volatility)
+# Symbols to trade
 SYMBOLS = [s.strip() for s in os.getenv('SYMBOLS', 'BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT').split(',')]
 TIMEFRAMES = ['15m', '1h', '4h']
 BINANCE_API_PUBLIC = "https://api.binance.com/api/v3"
 
-# ONE POSITION LOCK (single trade active at any time)
+# ONE POSITION LOCK
 GLOBAL_POSITION_LIMIT = 1
 
 # Validation
@@ -82,7 +114,7 @@ class Signal:
     confidence: float
     reasoning: str
     timestamp: datetime
-    signal_strength: float = 0.0  # 0-1 score of signal quality
+    signal_strength: float = 0.0
 
 @dataclass
 class Trade:
@@ -98,8 +130,8 @@ class Trade:
     exit_time: Optional[datetime] = None
     exit_price: Optional[float] = None
     pnl: float = 0.0
-    status: str = "OPEN"  # OPEN, WIN, LOSS
-    max_profit_price: float = 0.0  # Track highest price for trailing stop
+    status: str = "OPEN"
+    max_profit_price: float = 0.0
 
 # ============================================================================
 # ACCOUNT STATE (Single position only)
@@ -112,7 +144,7 @@ class SimulatedAccount:
         self.starting_balance = starting_balance
         self.current_balance = starting_balance
         self.trades: List[Trade] = []
-        self.active_trade: Optional[Trade] = None  # ONLY ONE
+        self.active_trade: Optional[Trade] = None
         self.total_pnl = 0.0
         self.total_trades = 0
         self.winning_trades = 0
@@ -128,11 +160,7 @@ class SimulatedAccount:
         return self.current_balance * RISK_PER_TRADE
 
     def calculate_position_size_with_leverage(self, risk_amount: float, entry: float, stop_loss: float, leverage: float) -> float:
-        """Calculate position size with leverage.
-        
-        Formula: position_size = (risk_amount * leverage) / |entry - stop_loss|
-        Example: $1 risk * 5x leverage / $100 distance = 0.05 BTC (5x exposure)
-        """
+        """Calculate position size with leverage."""
         distance_to_sl = abs(entry - stop_loss)
         if distance_to_sl == 0:
             return 0
@@ -152,7 +180,7 @@ class SimulatedAccount:
             return None
 
         # Determine leverage based on confidence
-        leverage = min(1 + (signal.confidence - 0.5) * 10, MAX_LEVERAGE)  # 1x to 10x
+        leverage = min(1 + (signal.confidence - 0.5) * 10, MAX_LEVERAGE)
         leverage = max(1.0, leverage)
 
         position_size = self.calculate_position_size_with_leverage(risk_amount, signal.entry, signal.stop_loss, leverage)
@@ -220,10 +248,13 @@ class SimulatedAccount:
         
         self.win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
 
+        # SAFE PNL PERCENTAGE CALCULATION
+        pnl_pct = (net_pnl / trade.risk_amount * 100) if trade.risk_amount > 0 else 0
+
         logger.info(
             f"✅ TRADE CLOSED: {trade.symbol} {trade.direction.value} | "
             f"Exit: ${exit_price:.2f} | Gross P&L: ${gross_pnl:+.2f} | "
-            f"Net P&L: ${net_pnl:+.2f} ({net_pnl/trade.risk_amount*100:+.1f}% of risk) | "
+            f"Net P&L: ${net_pnl:+.2f} ({pnl_pct:+.1f}% of risk) | "
             f"Balance: ${self.current_balance:.2f} | {reason}"
         )
         
@@ -252,7 +283,7 @@ class SimulatedAccount:
             if current_price >= trade.take_profit:
                 return self.close_trade(trade.take_profit, "TAKE_PROFIT_HIT")
             
-            # TRAILING STOP: close if price falls 1% from max
+            # TRAILING STOP
             trailing_stop = trade.max_profit_price * 0.99
             if current_price <= trailing_stop and trade.max_profit_price > trade.entry:
                 return self.close_trade(current_price, "TRAILING_STOP_HIT")
@@ -272,11 +303,14 @@ class SimulatedAccount:
 
     def print_status(self):
         """Print account summary."""
+        # SAFE PERCENTAGE CALCULATIONS
+        pnl_pct = (self.total_pnl / self.starting_balance * 100) if self.starting_balance > 0 else 0
+        
         logger.info("=" * 100)
         logger.info(f"💰 ACCOUNT STATUS")
         logger.info(f"   Starting Balance: ${self.starting_balance:.2f}")
         logger.info(f"   Current Balance:  ${self.current_balance:.2f}")
-        logger.info(f"   Total P&L:        ${self.total_pnl:+.2f} ({self.total_pnl/self.starting_balance*100:+.2f}%)")
+        logger.info(f"   Total P&L:        ${self.total_pnl:+.2f} ({pnl_pct:+.2f}%)")
         logger.info(f"   Trades:           {self.total_trades} (W:{self.winning_trades} L:{self.losing_trades}) WinRate:{self.win_rate:.1f}%")
         logger.info(f"   Active Position:  {'YES - ' + self.active_trade.symbol if self.active_trade else 'NO'}")
         logger.info("=" * 100)
@@ -290,46 +324,67 @@ class MarketData:
     
     def __init__(self):
         self.current_prices: Dict[str, float] = {}
+        self.session: Optional[aiohttp.ClientSession] = None
+
+    async def init_session(self):
+        """Initialize aiohttp session (call once at startup)."""
+        try:
+            self.session = aiohttp.ClientSession()
+            logger.info("✓ MarketData session initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize MarketData session: {e}")
+
+    async def close_session(self):
+        """Close aiohttp session (call on shutdown)."""
+        if self.session:
+            await self.session.close()
+            logger.info("✓ MarketData session closed")
 
     async def fetch_klines(self, symbol: str, interval: str = '1h', limit: int = 200) -> List[List]:
         """Fetch candlestick data."""
+        if not self.session:
+            return []
+        
         try:
             url = f"{BINANCE_API_PUBLIC}/klines"
             params = {'symbol': symbol, 'interval': interval, 'limit': limit}
             
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    elif resp.status == 429:
-                        logger.warning(f"Rate limited on {symbol}")
-                        return []
-                    else:
-                        logger.error(f"Failed to fetch {symbol} {interval}: HTTP {resp.status}")
-                        return []
+            async with self.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                elif resp.status == 429:
+                    logger.warning(f"Rate limited on {symbol}")
+                    return []
+                else:
+                    logger.error(f"Failed to fetch {symbol} {interval}: HTTP {resp.status}")
+                    return []
         except asyncio.TimeoutError:
             logger.error(f"Timeout fetching {symbol} {interval}")
             return []
         except Exception as e:
-            logger.error(f"Error fetching {symbol} {interval}: {e}")
+            logger.error(f"Error fetching {symbol} {interval}: {type(e).__name__}: {e}")
             return []
 
     async def fetch_current_price(self, symbol: str) -> Optional[float]:
         """Fetch current price."""
+        if not self.session:
+            return None
+        
         try:
             url = f"{BINANCE_API_PUBLIC}/ticker/price"
             params = {'symbol': symbol}
             
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        price = float(data['price'])
-                        self.current_prices[symbol] = price
-                        return price
-                    else:
-                        return None
-        except Exception:
+            async with self.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    price = float(data['price'])
+                    self.current_prices[symbol] = price
+                    return price
+                else:
+                    logger.debug(f"Failed to fetch price for {symbol}: HTTP {resp.status}")
+                    return None
+        except Exception as e:
+            logger.debug(f"Error fetching price for {symbol}: {type(e).__name__}")
             return None
 
 # ============================================================================
@@ -358,57 +413,56 @@ def calculate_rsi(prices: List[float], period: int = 14) -> float:
     down = sum(abs(x) for x in seed if x < 0) / period
     
     rs = up / down if down != 0 else 0
-    rsi = 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + rs)) if rs != 0 else 50
     
     for delta in deltas[period:]:
         up = (up * (period - 1) + (delta if delta > 0 else 0)) / period
         down = (down * (period - 1) + (abs(delta) if delta < 0 else 0)) / period
         rs = up / down if down != 0 else 0
-        rsi = 100 - (100 / (1 + rs))
+        rsi = 100 - (100 / (1 + rs)) if rs != 0 else 50
     
     return rsi
 
 def calculate_macd(prices: List[float]) -> tuple:
-    """MACD (Moving Average Convergence Divergence).
-    Returns: (macd_line, signal_line, histogram)
-    """
+    """MACD (Moving Average Convergence Divergence)."""
     if len(prices) < 26:
         return 0, 0, 0
     
     ema_12 = calculate_ema(prices[-26:], 12)
     ema_26 = calculate_ema(prices[-26:], 26)
     macd_line = ema_12 - ema_26
-    
-    # Signal line (EMA of MACD)
-    signal_line = ema_12 * 0.3 + ema_26 * 0.7  # Approximation
+    signal_line = ema_12 * 0.3 + ema_26 * 0.7
     histogram = macd_line - signal_line
     
     return macd_line, signal_line, histogram
 
 def calculate_stochastic_rsi(prices: List[float], period: int = 14) -> tuple:
-    """Stochastic RSI - combines RSI with stochastic oscillator.
-    Returns: (stoch_rsi, stoch_k, stoch_d)
-    """
+    """Stochastic RSI - combines RSI with stochastic oscillator."""
     if len(prices) < period * 2:
         return 50, 50, 50
     
-    rsi_values = []
-    for i in range(len(prices) - period):
-        rsi = calculate_rsi(prices[i:i+period])
-        rsi_values.append(rsi)
-    
-    if len(rsi_values) < 14:
+    try:
+        rsi_values = []
+        for i in range(len(prices) - period):
+            rsi = calculate_rsi(prices[i:i+period])
+            rsi_values.append(rsi)
+        
+        if len(rsi_values) < 14:
+            return 50, 50, 50
+        
+        min_rsi = min(rsi_values[-14:])
+        max_rsi = max(rsi_values[-14:])
+        range_rsi = max_rsi - min_rsi
+        
+        # SAFE DIVISION
+        stoch_rsi = (rsi_values[-1] - min_rsi) / (range_rsi + 0.001) * 100
+        stoch_k = stoch_rsi
+        stoch_d = (stoch_k + rsi_values[-1]) / 2
+        
+        return stoch_rsi, stoch_k, stoch_d
+    except Exception as e:
+        logger.debug(f"Error in calculate_stochastic_rsi: {type(e).__name__}")
         return 50, 50, 50
-    
-    min_rsi = min(rsi_values[-14:])
-    max_rsi = max(rsi_values[-14:])
-    range_rsi = max_rsi - min_rsi
-    
-    stoch_rsi = (rsi_values[-1] - min_rsi) / (range_rsi + 0.001) * 100
-    stoch_k = stoch_rsi
-    stoch_d = (stoch_k + rsi_values[-1]) / 2
-    
-    return stoch_rsi, stoch_k, stoch_d
 
 def generate_signal(symbol: str, klines_15m: List[List], klines_1h: List[List], 
                    klines_4h: List[List], current_price: float) -> Signal:
@@ -426,72 +480,66 @@ def generate_signal(symbol: str, klines_15m: List[List], klines_1h: List[List],
         # Calculate indicators
         ema_1h = calculate_ema(closes_1h, 9)
         ema_4h = calculate_ema(closes_4h, 9)
-        
         rsi_1h = calculate_rsi(closes_1h, 14)
         rsi_4h = calculate_rsi(closes_4h, 14)
-        
         macd_1h, signal_1h, hist_1h = calculate_macd(closes_1h)
         macd_4h, signal_4h, hist_4h = calculate_macd(closes_4h)
-        
         stoch_rsi_15m, k_15m, d_15m = calculate_stochastic_rsi(closes_15m)
-        stoch_rsi_1h, k_1h, d_1h = calculate_stochastic_rsi(closes_1h)
         
         direction = TradeDirection.NO_TRADE
         confidence = 0.0
         reasoning = ""
         signal_strength = 0.0
         
-        # LONG SETUP: Strong uptrend with oversold recovery
+        # LONG SETUP
         long_conditions = [
-            current_price > ema_1h,           # Price above 1h EMA
-            ema_1h > ema_4h,                  # 1h EMA above 4h EMA (uptrend)
-            rsi_1h > 40 and rsi_1h < 80,     # RSI not overbought
-            rsi_4h > 40 and rsi_4h < 80,     # 4h RSI healthy
-            macd_1h > signal_1h,              # MACD bullish
-            macd_4h > signal_4h,              # 4h MACD bullish
-            stoch_rsi_15m < 50,               # 15m Stochastic oversold (entry opportunity)
+            current_price > ema_1h,
+            ema_1h > ema_4h,
+            rsi_1h > 40 and rsi_1h < 80,
+            rsi_4h > 40 and rsi_4h < 80,
+            macd_1h > signal_1h,
+            macd_4h > signal_4h,
+            stoch_rsi_15m < 50,
         ]
         
         long_score = sum(long_conditions) / len(long_conditions)
         
-        if long_score >= 0.7:  # 70% conditions met
+        if long_score >= 0.7:
             direction = TradeDirection.LONG
             confidence = 0.80 + (long_score - 0.7) * 0.2
             signal_strength = long_score
-            reasoning = (f"🟢 LONG: Uptrend (1h>{4h}), MACD bullish, "
-                        f"RSI 1h:{rsi_1h:.1f}/4h:{rsi_4h:.1f}, StochRSI oversold")
+            reasoning = f"🟢 LONG: Uptrend, MACD bullish, RSI 1h:{rsi_1h:.1f}/4h:{rsi_4h:.1f}"
         
-        # SHORT SETUP: Strong downtrend with overbought rejection
+        # SHORT SETUP
         short_conditions = [
-            current_price < ema_1h,           # Price below 1h EMA
-            ema_1h < ema_4h,                  # 1h EMA below 4h EMA (downtrend)
-            rsi_1h > 20 and rsi_1h < 60,     # RSI not oversold
-            rsi_4h > 20 and rsi_4h < 60,     # 4h RSI healthy
-            macd_1h < signal_1h,              # MACD bearish
-            macd_4h < signal_4h,              # 4h MACD bearish
-            stoch_rsi_15m > 50,               # 15m Stochastic overbought (entry opportunity)
+            current_price < ema_1h,
+            ema_1h < ema_4h,
+            rsi_1h > 20 and rsi_1h < 60,
+            rsi_4h > 20 and rsi_4h < 60,
+            macd_1h < signal_1h,
+            macd_4h < signal_4h,
+            stoch_rsi_15m > 50,
         ]
         
         short_score = sum(short_conditions) / len(short_conditions)
         
-        if short_score >= 0.7:  # 70% conditions met
+        if short_score >= 0.7:
             direction = TradeDirection.SHORT
             confidence = 0.80 + (short_score - 0.7) * 0.2
             signal_strength = short_score
-            reasoning = (f"🔴 SHORT: Downtrend (1h<4h), MACD bearish, "
-                        f"RSI 1h:{rsi_1h:.1f}/4h:{rsi_4h:.1f}, StochRSI overbought")
+            reasoning = f"🔴 SHORT: Downtrend, MACD bearish, RSI 1h:{rsi_1h:.1f}/4h:{rsi_4h:.1f}"
         
         # Calculate SL/TP based on volatility
         if direction != TradeDirection.NO_TRADE:
             atr_estimate = max(closes_1h[-20:]) - min(closes_1h[-20:])
             if atr_estimate == 0:
-                atr_estimate = current_price * 0.03  # 3% default
+                atr_estimate = current_price * 0.03
             
             if direction == TradeDirection.LONG:
                 entry = current_price
                 stop_loss = current_price - atr_estimate * 0.6
-                take_profit = current_price + atr_estimate * 2.0  # 1:3.3 RR
-            else:  # SHORT
+                take_profit = current_price + atr_estimate * 2.0
+            else:
                 entry = current_price
                 stop_loss = current_price + atr_estimate * 0.6
                 take_profit = current_price - atr_estimate * 2.0
@@ -501,8 +549,8 @@ def generate_signal(symbol: str, klines_15m: List[List], klines_1h: List[List],
         return Signal(symbol, direction, entry, stop_loss, take_profit, confidence, reasoning, datetime.now(), signal_strength)
     
     except Exception as e:
-        logger.error(f"Error generating signal for {symbol}: {e}")
-        return Signal(symbol, TradeDirection.NO_TRADE, current_price, current_price, current_price, 0.0, f"Error: {e}", datetime.now())
+        logger.error(f"Error generating signal for {symbol}: {type(e).__name__}: {e}")
+        return Signal(symbol, TradeDirection.NO_TRADE, current_price, current_price, current_price, 0.0, f"Error: {type(e).__name__}", datetime.now())
 
 # ============================================================================
 # MAIN BOT LOOP
@@ -524,76 +572,85 @@ async def main():
 
     account = SimulatedAccount(STARTING_BALANCE)
     market = MarketData()
+    
+    # Initialize market data session
+    await market.init_session()
+    
     scan_count = 0
 
-    while True:
-        try:
-            scan_count += 1
-            logger.info(f"\n📡 SCAN #{scan_count} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    try:
+        while True:
+            try:
+                scan_count += 1
+                logger.info(f"\n📡 SCAN #{scan_count} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-            # FETCH ALL DATA CONCURRENTLY
-            tasks = []
-            for symbol in SYMBOLS:
-                tasks.append(market.fetch_current_price(symbol))
-                tasks.append(market.fetch_klines(symbol, '15m', 100))
-                tasks.append(market.fetch_klines(symbol, '1h', 100))
-                tasks.append(market.fetch_klines(symbol, '4h', 100))
+                # FETCH ALL DATA CONCURRENTLY
+                tasks = []
+                for symbol in SYMBOLS:
+                    tasks.append(market.fetch_current_price(symbol))
+                    tasks.append(market.fetch_klines(symbol, '15m', 100))
+                    tasks.append(market.fetch_klines(symbol, '1h', 100))
+                    tasks.append(market.fetch_klines(symbol, '4h', 100))
 
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # PROCESS RESULTS
-            idx = 0
-            best_signal = None
-            best_signal_symbol = None
-            
-            for symbol in SYMBOLS:
-                current_price = results[idx]
-                klines_15m = results[idx + 1]
-                klines_1h = results[idx + 2]
-                klines_4h = results[idx + 3]
-                idx += 4
+                # PROCESS RESULTS
+                idx = 0
+                best_signal = None
+                
+                for symbol in SYMBOLS:
+                    current_price = results[idx]
+                    klines_15m = results[idx + 1]
+                    klines_1h = results[idx + 2]
+                    klines_4h = results[idx + 3]
+                    idx += 4
 
-                # Handle fetch errors
-                if isinstance(current_price, Exception) or current_price is None:
-                    continue
+                    # Handle fetch errors
+                    if isinstance(current_price, Exception) or current_price is None:
+                        continue
 
-                # CHECK SL/TP FOR ACTIVE POSITION
-                if account.has_open_position() and account.active_trade.symbol == symbol:
-                    account.check_sl_tp(current_price)
+                    # CHECK SL/TP FOR ACTIVE POSITION
+                    if account.has_open_position() and account.active_trade.symbol == symbol:
+                        account.check_sl_tp(current_price)
 
-                # GENERATE SIGNAL
-                if isinstance(klines_15m, list) and isinstance(klines_1h, list) and isinstance(klines_4h, list):
-                    if len(klines_15m) > 0 and len(klines_1h) > 0 and len(klines_4h) > 0:
-                        signal = generate_signal(symbol, klines_15m, klines_1h, klines_4h, current_price)
-                        
-                        # FIND BEST SIGNAL (if no position open)
-                        if not account.has_open_position():
-                            if signal.direction != TradeDirection.NO_TRADE and signal.confidence >= CONFIDENCE_THRESHOLD:
-                                if best_signal is None or signal.confidence > best_signal.confidence:
-                                    best_signal = signal
-                                    best_signal_symbol = symbol
+                    # GENERATE SIGNAL
+                    if isinstance(klines_15m, list) and isinstance(klines_1h, list) and isinstance(klines_4h, list):
+                        if len(klines_15m) > 0 and len(klines_1h) > 0 and len(klines_4h) > 0:
+                            signal = generate_signal(symbol, klines_15m, klines_1h, klines_4h, current_price)
+                            
+                            # FIND BEST SIGNAL (if no position open)
+                            if not account.has_open_position():
+                                if signal.direction != TradeDirection.NO_TRADE and signal.confidence >= CONFIDENCE_THRESHOLD:
+                                    if best_signal is None or signal.confidence > best_signal.confidence:
+                                        best_signal = signal
 
-            # OPEN BEST SIGNAL (ONE AT A TIME)
-            if best_signal and not account.has_open_position():
-                account.open_trade(best_signal)
+                # OPEN BEST SIGNAL (ONE AT A TIME)
+                if best_signal and not account.has_open_position():
+                    account.open_trade(best_signal)
 
-            # PRINT STATUS EVERY 5 SCANS
-            if scan_count % 5 == 0:
-                account.print_status()
+                # PRINT STATUS EVERY 5 SCANS
+                if scan_count % 5 == 0:
+                    account.print_status()
 
-            logger.info(f"⏳ Waiting {SCAN_INTERVAL}s until next scan...")
-            await asyncio.sleep(SCAN_INTERVAL)
+                logger.info(f"⏳ Waiting {SCAN_INTERVAL}s until next scan...")
+                await asyncio.sleep(SCAN_INTERVAL)
 
-        except Exception as e:
-            logger.error(f"Error in main loop: {type(e).__name__}: {e}")
-            await asyncio.sleep(10)
+            except Exception as e:
+                logger.error(f"Error in scan loop: {type(e).__name__}: {e}", exc_info=False)
+                await asyncio.sleep(10)  # Brief pause before retry
+    
+    finally:
+        # Cleanup on exit
+        await market.close_session()
+        logger.info("✓ Bot shutdown complete")
 
 if __name__ == '__main__':
     try:
+        # Run the main coroutine (asyncio.run handles event loop creation/cleanup)
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("\n👋 Bot stopped by user")
         sys.exit(0)
     except Exception as e:
-        logger.error(f"Fatal error: {type(e).__name__}: {e}")
+        logger.error(f"Fatal error: {type(e).__name__}: {e}", exc_info=True)
         sys.exit(1)
