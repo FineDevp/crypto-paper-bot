@@ -9,16 +9,29 @@ type Status = {
   scan_interval: number
 }
 
+type Trade = {
+  id?: number
+  ts?: string
+  symbol: string
+  size: number
+  risk: number
+  action?: string
+  price?: number
+  paper?: boolean
+}
+
 export default function App(){
   const [status, setStatus] = useState<Status | null>(null)
   const [logs, setLogs] = useState<string[]>([])
+  const [trades, setTrades] = useState<Trade[]>([])
   const [token, setToken] = useState<string | null>(sessionStorage.getItem('DASH_TOKEN'))
 
-  useEffect(()=>{ fetchStatus(); fetchLogs(); const es = new EventSource('/api/events'); es.onmessage = (e)=>{ try{ const d=JSON.parse(e.data); if(d.type==='status') setStatus(d.payload); if(d.type==='log') setLogs(prev=>[d.payload,...prev].slice(0,200)); }catch(e){} }; return ()=>es.close(); },[])
+  useEffect(()=>{ fetchStatus(); fetchLogs(); fetchTrades(); const es = new EventSource('/api/events'); es.onmessage = (e)=>{ try{ const d=JSON.parse(e.data); if(d.type==='status') setStatus(d.payload); if(d.type==='log') setLogs(prev=>[d.payload,...prev].slice(0,200)); }catch(e){} }; return ()=>es.close(); },[])
 
   async function fetchStatus(){ const r = await fetch('/api/status'); if(r.ok) setStatus(await r.json()); }
   async function fetchLogs(){ const r = await fetch('/api/logs?limit=50'); if(r.ok) setLogs((await r.json()).reverse()); }
-  async function control(action:string){ const headers:any = {'Content-Type':'application/json'}; if(token) headers['x-dashboard-token']=token; const r = await fetch('/api/control',{method:'POST',headers,body:JSON.stringify({action})}); const j = await r.json(); if(!r.ok) alert(JSON.stringify(j)); else fetchStatus(); }
+  async function fetchTrades(){ const r = await fetch('/api/trades?limit=100'); if(r.ok) setTrades(await r.json()); }
+  async function control(action:string){ const headers:any = {'Content-Type':'application/json'}; if(token) headers['x-dashboard-token']=token; const r = await fetch('/api/control',{method:'POST',headers,body:JSON.stringify({action})}); const j = await r.json(); if(!r.ok) alert(JSON.stringify(j)); else { fetchStatus(); fetchTrades(); } }
 
   function login(){ sessionStorage.setItem('DASH_TOKEN', token||''); location.reload(); }
 
@@ -44,6 +57,31 @@ export default function App(){
             </div>
           </div>
         ) : (<p>loading...</p>)}
+      </div>
+
+      <div className="card">
+        <h3>Recent Trades</h3>
+        <table style={{width:'100%', borderCollapse:'collapse'}}>
+          <thead>
+            <tr style={{textAlign:'left'}}>
+              <th>#</th><th>ts</th><th>symbol</th><th>size</th><th>risk</th><th>price</th><th>paper</th>
+            </tr>
+          </thead>
+          <tbody>
+            {trades.map((t,i)=>(
+              <tr key={i} style={{borderTop:'1px solid rgba(255,255,255,0.03)'}}>
+                <td>{t.id}</td>
+                <td>{t.ts}</td>
+                <td>{t.symbol}</td>
+                <td>{t.size}</td>
+                <td>{t.risk}</td>
+                <td>{t.price}</td>
+                <td>{String(t.paper)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <button onClick={fetchTrades}>Refresh Trades</button>
       </div>
 
       <div className="card">

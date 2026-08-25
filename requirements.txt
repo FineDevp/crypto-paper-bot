@@ -1,3 +1,5 @@
 fastapi
 uvicorn[standard]
 sse-starlette
+SQLAlchemy
+psycopg2-binary
