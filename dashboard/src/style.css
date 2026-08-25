@@ -1,0 +1,9 @@
+body{ font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial; background:#0f1720; color:#e6edf3; margin:0; padding:20px }
+.container{ max-width:900px; margin:0 auto }
+.card{ background:#111827; padding:16px; border-radius:8px; margin-bottom:12px }
+.buttons button{ margin-right:8px }
+.logs{ max-height:300px; overflow:auto; background:#0b1220; padding:8px; border-radius:4px }
+.log-line{ font-family: monospace; font-size:13px; padding:2px 0; color:#cfe8ff }
+input{ padding:8px; margin-right:8px }
+button{ padding:8px 12px; background:#06b6d4; border:none; color:#062026; border-radius:6px; cursor:pointer }
+button:hover{ opacity:0.9 }
