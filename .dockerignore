@@ -1,0 +1,14 @@
+node_modules
+dist
+dashboard/node_modules
+dashboard/dist
+.env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv
+.vscode
+.idea
+*.db
